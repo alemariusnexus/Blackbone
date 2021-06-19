@@ -22,80 +22,84 @@ RemoteLocalHook::RemoteLocalHook( class Process& process )
 
 RemoteLocalHook::~RemoteLocalHook()
 {
-    Restore();
+	reset();
 }
 
-NTSTATUS RemoteLocalHook::AllocateMem( ptr_t address, size_t hookCodeSize )
+size_t RemoteLocalHook::GetDisplacedOriginalCode( ptr_t address, uint8_t* code )
 {
+	auto it = _hooks.find( address );
+	if (it == _hooks.end())
+		return 0;
+	HookCtx& ctx = it->second;
+	if (code)
+		memcpy(code, ctx.origCode, ctx.origCodeSize);
+	return ctx.origCodeSize;
+}
+
+bool RemoteLocalHook::isHooked( ptr_t address ) const
+{
+	auto it = _hooks.find( address );
+	if (it == _hooks.end())
+		return false;
+	return it->second.hooked;
+}
+
+NTSTATUS RemoteLocalHook::PrepareHook( ptr_t address, size_t maxHookSize, eJumpStrategy jumpStrategy, const asmjit::X86GpReg& reg )
+{
+	HookCtx ctx;
+
+	ctx.address = address;
+	ctx.jumpStrategy = jumpStrategy;
+	ctx.jumpRegister = &reg;
+
 	auto pagesize = _process.core().native()->pageSize();
-    auto size = Align( hookCodeSize + THUNK_MAX_SIZE, pagesize );
+    auto size = Align( maxHookSize + THUNK_MAX_SIZE, pagesize );
 
     auto allocation = _process.memory().AllocateClosest( size, PAGE_EXECUTE_READWRITE, address );
     if (!allocation)
         return allocation.status;
 
-    _hookData   = std::move( allocation.result() );
-    return allocation.status;
-}
+    ctx.hookData = std::move( allocation.result() );
 
-void RemoteLocalHook::SetJumpStrategy(eJumpStrategy strategy)
-{
-	_jumpStrategy = strategy;
-}
-
-void RemoteLocalHook::SetJumpRegister(const asmjit::X86GpReg& reg)
-{
-	_jumpRegister = &reg;
-}
-
-size_t RemoteLocalHook::GetDisplacedOriginalCode( uint8_t* code )
-{
-	if (!_prepared)
-		return 0;
-	if (code)
-		memcpy(code, _ctx.origCode, _ctx.origCodeSize);
-	return _ctx.origCodeSize;
-}
-
-NTSTATUS RemoteLocalHook::PrepareHook( ptr_t address, size_t maxHookSize )
-{
-	_ctx.address = address;
-    NTSTATUS status = AllocateMem( address, maxHookSize );
-    if (!NT_SUCCESS( status ))
-        return status;
-
-    _ctx.thunkAddr = _hookData.ptr() + maxHookSize;
+    ctx.thunkAddr = ctx.hookData.ptr() + maxHookSize;
 
 
     bool x64 = !_process.core().isWow64();
 
-    _ctx.hookJumpCodeSize = GenerateJump( _ctx.hookJumpCode, _hookData.ptr(), address, x64 );
+    ctx.hookJumpCodeSize = GenerateJump( ctx, ctx.hookJumpCode, ctx.hookData.ptr(), address, x64 );
 
-    status = CopyOldCode( x64 );
+    NTSTATUS status = CopyOldCode( ctx, x64 );
     if (!NT_SUCCESS( status )) {
-    	_hookData.Free();
-    	_hookData = MemBlock();
+    	ctx.hookData.Free();
 		return status;
     }
 
-    _prepared = true;
+    ctx.hooked = false;
+
+    _hooks.emplace( address, std::move(ctx) );
 
     return STATUS_SUCCESS;
 }
 
-NTSTATUS RemoteLocalHook::SetHook( ptr_t address, asmjit::Assembler& hook )
+NTSTATUS RemoteLocalHook::SetHook( ptr_t address, asmjit::Assembler& hook, eJumpStrategy jumpStrategy, const asmjit::X86GpReg& reg )
 {
 	bool x64 = !_process.core().isWow64();
     auto& mem = _process.memory();
 
     NTSTATUS status = STATUS_SUCCESS;
 
-    if (!_prepared) {
-    	status = PrepareHook( address, hook.getCodeSize() );
+    auto it = _hooks.find( address );
+
+    if (it == _hooks.end()) {
+    	status = PrepareHook(address, hook.getCodeSize(), jumpStrategy, reg);
     	if (!NT_SUCCESS( status )) {
     		return status;
     	}
+
+    	it = _hooks.find( address );
     }
+
+    HookCtx& ctx = it->second;
 
     uint8_t hookCode[256];
     uint8_t* heapHookCode = nullptr; // Only used if hook.getCodeSize() > sizeof(hookCode)
@@ -104,27 +108,27 @@ NTSTATUS RemoteLocalHook::SetHook( ptr_t address, asmjit::Assembler& hook )
     	heapHookCode = new uint8_t[hook.getCodeSize()];
     }
 
-    hook.setBaseAddress( _hookData.ptr() );
+    hook.setBaseAddress( ctx.hookData.ptr() );
 	hook.relocCode( heapHookCode ? heapHookCode : hookCode );
 
-	uint8_t jmpBackCode[sizeof(_ctx.hookJumpCode)];
+	uint8_t jmpBackCode[sizeof(ctx.hookJumpCode)];
 	uint8_t jmpBackCodeSize;
 
-	jmpBackCodeSize = GenerateJump(jmpBackCode, address + _ctx.origCodeSize, _hookData.ptr() + hook.getCodeSize() + _ctx.origCodeSize, x64);
+	jmpBackCodeSize = GenerateJump( ctx, jmpBackCode, address + ctx.origCodeSize, ctx.hookData.ptr() + hook.getCodeSize() + ctx.origCodeSize, x64 );
 
-	if (hook.getCodeSize() > (_ctx.thunkAddr - _hookData.ptr())) {
+	if (hook.getCodeSize() > (ctx.thunkAddr - ctx.hookData.ptr())) {
     	// Can happen if PrepareHook() was called manually with maxCodeSize < hook.getCodeSize().
 		delete[] heapHookCode;
     	return STATUS_NO_MEMORY;
     }
 
-    mem.Write( _hookData.ptr(), hook.getCodeSize(), heapHookCode ? heapHookCode : hookCode );
-	mem.Write( _ctx.thunkAddr, _ctx.origCodeSize, _ctx.patchedOrigCode );
-	mem.Write( _ctx.thunkAddr + _ctx.origCodeSize, jmpBackCodeSize, jmpBackCode );
+    mem.Write( ctx.hookData.ptr(), hook.getCodeSize(), heapHookCode ? heapHookCode : hookCode );
+	mem.Write( ctx.thunkAddr, ctx.origCodeSize, ctx.patchedOrigCode );
+	mem.Write( ctx.thunkAddr + ctx.origCodeSize, jmpBackCodeSize, jmpBackCode );
 
 	// Fill region between end of hook and start of thunk with nop. This region is normally empty, but can be non-empty
 	// if PrepareHook() was called manually with maxCodeSize > hook.getCodeSize().
-	for (ptr_t addr = _hookData.ptr() + hook.getCodeSize() ; addr < _ctx.thunkAddr ; addr++)
+	for (ptr_t addr = ctx.hookData.ptr() + hook.getCodeSize() ; addr < ctx.thunkAddr ; addr++)
 	{
 		uint8_t nop = 0x90;
 		mem.Write(addr, nop);
@@ -133,51 +137,80 @@ NTSTATUS RemoteLocalHook::SetHook( ptr_t address, asmjit::Assembler& hook )
 	delete[] heapHookCode;
 
 	DWORD flOld = 0;
-	mem.Protect( address, _ctx.hookJumpCodeSize, PAGE_EXECUTE_READWRITE, &flOld );
-	status = mem.Write( address, _ctx.hookJumpCodeSize, _ctx.hookJumpCode );
-	mem.Protect( address, _ctx.hookJumpCodeSize, flOld );
+	mem.Protect( address, ctx.hookJumpCodeSize, PAGE_EXECUTE_READWRITE, &flOld );
+	status = mem.Write( address, ctx.hookJumpCodeSize, ctx.hookJumpCode );
+	mem.Protect( address, ctx.hookJumpCodeSize, flOld );
 
 	if (NT_SUCCESS( status ))
-		_hooked = true;
+		ctx.hooked = true;
 
 	return status;
 }
 
-NTSTATUS RemoteLocalHook::Restore()
+NTSTATUS RemoteLocalHook::Restore( ptr_t address )
 {
+	auto it = _hooks.find( address );
+	if (it == _hooks.end()) {
+		return STATUS_INVALID_ADDRESS;
+	}
+
+	HookCtx& ctx = it->second;
+
     NTSTATUS status = STATUS_SUCCESS;
 
-	if (_hooked) {
+	if (ctx.hooked) {
 		DWORD flOld = 0;
-		_process.memory().Protect( _ctx.address, _ctx.hookJumpCodeSize, PAGE_EXECUTE_READWRITE, &flOld );
-		status = _process.memory().Write( _ctx.address, _ctx.origCodeSize, _ctx.origCode );
-		_process.memory().Protect( _ctx.address, _ctx.hookJumpCodeSize, flOld );
+		_process.memory().Protect( ctx.address, ctx.hookJumpCodeSize, PAGE_EXECUTE_READWRITE, &flOld );
+		status = _process.memory().Write( ctx.address, ctx.origCodeSize, ctx.origCode );
+		_process.memory().Protect( ctx.address, ctx.hookJumpCodeSize, flOld );
 
 		if (!NT_SUCCESS( status )) {
 			return status;
 		}
 	}
-	if (_hookData.valid()) {
-		_hookData.Free();
-		_hookData = MemBlock();
+	if (ctx.hookData.valid()) {
+		ctx.hookData.Free();
+		ctx.hookData = MemBlock();
 	}
 
-	_prepared = false;
-	_hooked = false;
+	_hooks.erase(it);
 
     return status;
 }
 
-NTSTATUS RemoteLocalHook::CopyOldCode( bool x64 )
+NTSTATUS RemoteLocalHook::Detach( ptr_t address )
+{
+	auto it = _hooks.find( address );
+	if (it == _hooks.end()) {
+		return STATUS_INVALID_ADDRESS;
+	}
+
+	HookCtx& ctx = it->second;
+
+	ctx.hookData.Release();
+
+	_hooks.erase(it);
+
+	return STATUS_SUCCESS;
+}
+
+void RemoteLocalHook::reset()
+{
+	while (!_hooks.empty()) {
+		Restore( _hooks.begin()->first );
+	}
+}
+
+NTSTATUS RemoteLocalHook::CopyOldCode( HookCtx& ctx, bool x64 )
 {
 	NTSTATUS status = STATUS_SUCCESS;
 
-	_process.memory().Read( _ctx.address, sizeof( _ctx.origCode ), _ctx.origCode );
-	memcpy(_ctx.patchedOrigCode, _ctx.origCode, sizeof(_ctx.patchedOrigCode));
+	_process.memory().Read( ctx.address, sizeof( ctx.origCode ), ctx.origCode );
+	memcpy( ctx.patchedOrigCode, ctx.origCode, sizeof(ctx.patchedOrigCode) );
 
     // Store original bytes
-	uint8_t* src = _ctx.origCode;
-	ptr_t newAddr = _ctx.thunkAddr;
+	uint8_t* src = ctx.origCode;
+	ptr_t newAddr = ctx.thunkAddr;
     uint32_t thunkSize = 0;
     ldasm_data ld = { 0 };
 
@@ -209,36 +242,36 @@ NTSTATUS RemoteLocalHook::CopyOldCode( bool x64 )
             // An attempted (partial) solution to https://github.com/DarthTon/Blackbone/issues/418
             // TODO: Do NOT adjust the offset if it points to WITHIN the code that's being moved!
 
-            int64_t newDiff = ((int64_t) diff) + (((ptr_t) (_ctx.address+thunkSize))-newAddr);
+            int64_t newDiff = ((int64_t) diff) + (((ptr_t) (ctx.address+thunkSize))-newAddr);
 
             if (newDiff < diffMinVals[sz]  ||  newDiff > diffMaxVals[sz]) {
             	status = STATUS_NOT_IMPLEMENTED;
             	break;
             }
 
-            memcpy(_ctx.patchedOrigCode + thunkSize + ofst, &newDiff, sz);
+            memcpy(ctx.patchedOrigCode + thunkSize + ofst, &newDiff, sz);
         }
 
         src += len;
         newAddr += len;
         thunkSize += len;
-    } while (thunkSize < _ctx.hookJumpCodeSize);
+    } while (thunkSize < ctx.hookJumpCodeSize);
 
     assert(thunkSize <= MaxOriginalCodeLen);
 
-    if (thunkSize < _ctx.hookJumpCodeSize)
+    if (thunkSize < ctx.hookJumpCodeSize)
     {
     	// TODO: Anything else we can do now?
     }
     else
     {
-		_ctx.origCodeSize = static_cast<uint8_t>(thunkSize);
+    	ctx.origCodeSize = static_cast<uint8_t>(thunkSize);
     }
 
     return status;
 }
 
-uint8_t RemoteLocalHook::GenerateJump( uint8_t* code, ptr_t toAddr, ptr_t fromAddr, bool x64 ) const
+uint8_t RemoteLocalHook::GenerateJump( HookCtx& ctx, uint8_t* code, ptr_t toAddr, ptr_t fromAddr, bool x64 ) const
 {
 	size_t size = 0;
 
@@ -249,7 +282,7 @@ uint8_t RemoteLocalHook::GenerateJump( uint8_t* code, ptr_t toAddr, ptr_t fromAd
 
 	if (x64  &&  _abs64( relJmp ) > INT32_MAX)
 	{
-		switch (_jumpStrategy)
+		switch (ctx.jumpStrategy)
 		{
 		case JumpPushMovRet:
 			// A relatively non-intrusive way to jmp far on x86_64, leaving all registers intact.
@@ -283,10 +316,12 @@ uint8_t RemoteLocalHook::GenerateJump( uint8_t* code, ptr_t toAddr, ptr_t fromAd
 		case JumpMovRegRet:
 			// Alternative method that overwrites a register, but keeps the stack untouched. See #2:
 			//		https://www.ragestorm.net/blogs/?p=107
-			a->mov(*_jumpRegister, (uint64_t) toAddr);
-			a->jmp(*_jumpRegister);
-			size = a->relocCode(code);
+			a->mov(*ctx.jumpRegister, (uint64_t) toAddr);
+			a->jmp(*ctx.jumpRegister);
+			size = uint8_t(a->relocCode(code));
 			break;
+		default:
+			assert(false);
 		}
 	}
 	else
@@ -298,7 +333,7 @@ uint8_t RemoteLocalHook::GenerateJump( uint8_t* code, ptr_t toAddr, ptr_t fromAd
 		size = 5;
 	}
 
-	assert(size <= sizeof(_ctx.hookJumpCode));
+	assert(size <= sizeof(ctx.hookJumpCode));
 	return static_cast<uint8_t>(size);
 }
 
