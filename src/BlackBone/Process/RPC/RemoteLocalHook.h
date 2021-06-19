@@ -5,6 +5,8 @@
 #include "../../Include/Types.h"
 #include "../MemBlock.h"
 
+#include <map>
+
 
 
 namespace blackbone
@@ -46,6 +48,11 @@ private:
 		uint8_t patchedOrigCode[MaxPatchedOriginalCodeLen];
 		uint8_t hookJumpCode[MaxHookJumpCodeLen];
 		uint8_t hookJumpCodeSize;
+
+		MemBlock hookData;
+		eJumpStrategy jumpStrategy;
+		const asmjit::X86GpReg* jumpRegister;
+		bool hooked;
 	};
 	#pragma pack(pop)
 
@@ -53,37 +60,32 @@ public:
     RemoteLocalHook( class Process& process );
     ~RemoteLocalHook();
 
-    void SetJumpStrategy(eJumpStrategy strategy);
-    void SetJumpRegister(const asmjit::X86GpReg& reg);
+    NTSTATUS SetHook( ptr_t address, asmjit::Assembler& hook, eJumpStrategy jumpStrategy = JumpPushMovRet,
+    		const asmjit::X86GpReg& reg = asmjit::host::rax );
+    NTSTATUS Restore( ptr_t address );
 
-    NTSTATUS SetHook( ptr_t address, asmjit::Assembler& hook );
-    NTSTATUS Restore();
+    void reset();
 
-    NTSTATUS PrepareHook( ptr_t address, size_t maxHookSize );
+    NTSTATUS PrepareHook( ptr_t address, size_t maxHookSize, eJumpStrategy jumpStrategy = JumpPushMovRet,
+    		const asmjit::X86GpReg& reg = asmjit::host::rax );
 
-    size_t GetDisplacedOriginalCode( uint8_t* code = nullptr );
+    NTSTATUS Detach( ptr_t address );
 
-    bool isHooked() const { return _hooked; }
+    size_t GetDisplacedOriginalCode( ptr_t address, uint8_t* code = nullptr );
+
+    bool isHooked( ptr_t address ) const;
 
 private:
     RemoteLocalHook( const RemoteLocalHook& ) = delete;
     RemoteLocalHook& operator = (const RemoteLocalHook&) = delete;
 
-    NTSTATUS AllocateMem( ptr_t address, size_t hookCodeSize );
+    NTSTATUS CopyOldCode( HookCtx& ctx, bool x64 );
 
-    NTSTATUS CopyOldCode( bool x64 );
-
-    uint8_t GenerateJump( uint8_t* code, ptr_t toAddr, ptr_t fromAddr, bool x64 ) const;
+    uint8_t GenerateJump( HookCtx& ctx, uint8_t* code, ptr_t toAddr, ptr_t fromAddr, bool x64 ) const;
 
 private:
     class Process& _process;
-    HookCtx _ctx;
-    MemBlock _hookData;
-    eJumpStrategy _jumpStrategy = JumpPushMovRet;
-    const asmjit::X86GpReg* _jumpRegister = &asmjit::host::rax;
-
-    bool _prepared = false;
-    bool _hooked = false;
+    std::map<ptr_t, HookCtx> _hooks;
 };
 
 }
